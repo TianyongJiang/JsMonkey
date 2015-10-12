@@ -1,0 +1,310 @@
+# encoding: utf-8
+#!/usr/bin/env ruby
+# 
+# Date:: 2012-12-21
+##############################
+require 'optparse'
+require 'net/smtp'
+require 'net/http'
+require "rexml/document"
+require "json"
+require "iconv"
+
+# 1 init path
+SUPERJS_HOME = File.dirname(File.dirname(File.expand_path(__FILE__)))
+hostname = `hostname`
+hostname = hostname.strip
+
+# 2 require phantomjs_wrapper.rb
+require "#{SUPERJS_HOME}/lib/phantomjs_wrapper"
+
+# 3.处理命令行参数，传递给phantomjs的命令参数不再此处处理，但可以使用
+options = {}
+option_parser = OptionParser.new do |opts|
+  opts.banner = 'Usage: sjrun [casefile|casedir] [OPTION]'
+
+  options[:case] = ""
+  opts.on('-c A,B', '--case A,B', Array, 'List of case file') do |value|
+      options[:case] = value
+  end  
+
+  options[:dir] = ""
+  opts.on('-d A,B', '--dir A,B', Array, 'List of case dir') do |value|
+      options[:dir] = value
+  end  
+
+  options[:xunit] = ""
+  opts.on('-x FILE', '--xunit FILE', 'Set xunit report file, default no xunit report save') do |value|
+    options[:xunit] = value
+  end
+
+  options[:retry] = 3
+  opts.on('-r TIMES', '--retry TIMES', 'set case retry times, default is 3') do |value|
+    options[:retry] = value
+  end
+
+  options[:sender] = hostname
+  opts.on('-s Email', '--sender Email', 'set email sender address, default is superjs@baidu.com') do |value|
+      options[:sender] = value
+  end
+  
+  options[:title] = "[superjs] case report"
+  opts.on('-t Title', '--title Title', 'set email title, default is [superjs] case report') do |value|
+      options[:title] = value
+  end
+  
+  options[:addressee] = []
+  opts.on('-a A,B', '--addressee A,B', Array, 'List of email addressee, default is null and no email send') do |value|
+    options[:addressee] = value
+  end
+
+  options[:failmail] = false
+  opts.on('-f', '--failmail', 'send mail only when some case run fail.') do 
+      options[:failmail] = true
+  end
+  
+  options[:level] = 0
+  opts.on('-l Level', '--level Title', 'run asserts which level value is less then this,if value is 0,run all asserts') do |value| 
+      options[:level] = value.to_i
+  end
+  
+  options[:phonenum] = ''
+  opts.on('-p A,B', '--phonenum A,B', Array, 'List of phonenum, send short message to phonenum where some case fail.') do |value|
+    options[:phonenum] = value
+  end
+
+  options[:message] = "superjs case fail!!!"
+  opts.on('-m msg', '--message msg', 'set short message content, default is superjs case fail') do |value|
+      options[:message] = value
+  end
+  
+  options[:project] = ""
+  opts.on('-j project', '--project project name', 'set project name') do |value|
+      options[:project] = value
+  end
+
+  options[:senddata] = false
+  opts.on('-l', '--sendxml', 'send xmldata to a url') do
+      options[:senddata] = true
+  end
+
+end
+if CASPER_ARGS.size == 0
+    puts option_parser.to_s
+end
+targetPath = []
+until(CASPER_ARGS.size == 0 or (CASPER_ARGS[0].start_with? '-')) do
+    targetPath.push CASPER_ARGS.delete_at(0)
+end
+__user_defind_option = Array.new
+while(CASPER_ARGS.size > 0)
+    begin
+        size = CASPER_ARGS.size
+        option_parser.parse!(CASPER_ARGS)
+        #如果处理一次，CASPER_ARGS里的参数并未减少，说明第一个参数不是预期参数，从CASPER_ARGS并放入__user_defind_option
+        __user_defind_option.push(CASPER_ARGS.delete_at(0)) if size == CASPER_ARGS.size
+    rescue OptionParser::InvalidOption => e
+        __user_defind_option.push(e.to_s.sub(/invalid option:\s+/,''))
+    end
+end
+targetPath.each do |path|
+    if File.directory? path 
+        if options[:dir].kind_of?(Array)
+            options[:dir].push path
+        else
+            options[:dir] = [path]
+        end
+    elsif File.file? path
+        if options[:case].kind_of?(Array)
+            options[:case].push path
+        else
+            options[:case] = [path]
+        end
+    end
+end
+# 4.汇总需要执行的用例文件
+
+pendcases = []
+if(options[:project] !="")
+    #uri = URI("http://db-testing-wisese00.db01.baidu.com:8341/finder/getpendcase?project=#{options[:project]}")
+    uri = URI("http://cq01-testing-wiseh103.cq01.baidu.com:8341/finder/getpendcase?project=#{options[:project]}")
+    res = Net::HTTP.get_response(uri)
+    pendcases = JSON.parse(res.body) unless res.nil?
+end
+caseFiles = []
+caseFiles.concat(options[:case]) if options[:case].kind_of?(Array)
+if options[:dir].kind_of?(Array)
+    options[:dir].each do |dpath|
+        jsFiles = Dir[dpath + '/**/*.js'] 
+        jsFiles = jsFiles.delete_if do |file|
+            pendcases.include? File.basename(file)
+        end
+        caseFiles.concat jsFiles
+    end
+end
+
+exit(0) unless caseFiles.length > 0
+# 5.拼接phantomjs命令行
+casper_command = []
+casper_command << (ENV["PHANTOMJS_EXECUTABLE"] || "phantomjs.bin")
+casper_command << "--web-security=no"
+casper_command.concat PHANTOMJS_ARGS
+casper_command << File.join(SUPERJS_HOME, "modules", "loader", "superjs_loader.js")
+casper_path = File.dirname(File.dirname(Gem.bin_path('casperjs','casperjs')))
+casper_command << "--casper-path=#{casper_path}"
+casper_command << "--assert-level=#{options[:level]}"
+casper_command << "--cli"
+casper_command = casper_command.join(' ')
+
+# 6. 遍历caseFiles，执行每一个用例文件
+exitstatus = 0
+xunitDoc = REXML::Document.new
+testsuites = REXML::Element.new "testsuites"
+xunitDoc.add_element testsuites
+testsuite = REXML::Element.new "testsuite"
+testsuites.add_element testsuite
+errors = 0
+failures = 0
+tests = 0
+skipped = 0
+time = 0
+mail_recipients = []
+results = []
+errorMessage = "【框线上监控报警】：\n"
+caseFiles.each do |script|
+    __tmp_xunit_report = '.superjs_xunit_report.xml'
+    __tmp_casper_command = casper_command + ' ' + script + ' --xunit=' + __tmp_xunit_report + ' ' +  __user_defind_option.join(' ')
+    script = File.absolute_path(script)
+    puts "casefile:#{script}"
+    options[:retry].to_i.times do
+        system(__tmp_casper_command)
+        break if $?.exitstatus == 0
+    end
+    exitstatus = $?.exitstatus if $?.exitstatus != 0
+    next unless File.file? __tmp_xunit_report
+    _doc = REXML::Document.new File.new(__tmp_xunit_report) 
+    _doc.root.add_attribute "filepath", script
+    if _doc.root.attribute("failures").value.to_i > 0 or _doc.root.attribute("errors").value.to_i > 0
+        results.unshift _doc
+    else
+        results.push _doc
+    end
+    File.delete __tmp_xunit_report if File.exist? __tmp_xunit_report
+end
+results.each do |result_doc|
+	cnt = result_doc.root.get_elements('//failure').count
+	for i in 0 .. cnt - 1 do
+		failMessage = result_doc.get_elements('//failure')[i].get_text().value();
+		if (failMessage.include? "testurl:")
+			tmpMessage =  failMessage[0, failMessage.index("testurl:")];
+		else
+			tmpMessage = failMessage
+		end
+		errorMessage = errorMessage + "#{tmpMessage}" + "\n"
+	end
+	
+    #if('' != errorMessage && !(result_doc.root.get_elements('//failure')[0].nil?))
+    #    failMessage = result_doc.get_elements('//failure')[0].get_text().value();
+    #    failMessage = REXML::Text::unnormalize(failMessage);
+    #    screenshot = result_doc.root.get_elements('//failure')[0].attribute("screenshot").to_s;
+    #    screenshot = REXML::Text::unnormalize(screenshot);
+    #    testurl = result_doc.root.get_elements('//failure')[0].attribute("testurl").to_s;
+    #    testurl = REXML::Text::unnormalize(testurl);
+    #    errorMessage = "err_msg:#{failMessage},  test_url: #{testurl}"
+    #end 
+    errors += result_doc.root.attribute("errors").value.to_i 
+    failures += result_doc.root.attribute("failures").value.to_i
+    tests += result_doc.root.attribute("tests").value.to_i
+    skipped += result_doc.root.attribute("skipped").value.to_i
+    time += result_doc.root.attribute("time").value.to_f
+    testcase = result_doc.root.get_elements('//testcase')[0]
+    testcase.add_attribute "filepath", result_doc.root.attribute("filepath").value
+    testsuite.add_element testcase
+    description = testcase.attribute('description').value
+    author = testcase.attribute('author').value
+    author.split(',').each do |x|
+        if author != 'unkown' 
+            mail_recipients.push x
+        end
+    end
+end
+
+testsuite.add_attribute "host",hostname
+testsuite.add_attribute "errors", errors
+testsuite.add_attribute "failures", failures
+testsuite.add_attribute "tests", tests
+testsuite.add_attribute "skipped", skipped
+testsuite.add_attribute "time", time
+
+
+# 7. 保存xunit报告到指定的文件中
+xunit_file_path = options[:xunit] == "" ? '.tmp_superjs_xunit_report.xml' : options[:xunit]
+xunit_file_handle = open(xunit_file_path,'w')
+xunitDoc.write(xunit_file_handle, 4)
+xunit_file_handle.close
+
+htmlMailContent = nil
+if( options[:project] != "")
+    Net::HTTP.start('cq01-testing-wiseh103.cq01.baidu.com', 8341) {|http|
+        body = open(xunit_file_path).read
+        htmlMailContent = http.post("/finder/uploadreport?project=#{options[:project]}&level=#{options[:level]}",body).body.to_s.force_encoding('ISO-8859-1')
+    }
+end
+# 8. 发邮件报表
+if !mail_recipients.empty?
+    if options[:addressee].empty?
+        options[:failmail] = true
+    end
+    mail_recipients.each do |author|
+        if !options[:addressee].include?(author)
+            options[:addressee].push author
+        end
+    end
+end
+options[:addressee].each_with_index do |x, i|
+    if !x.include?('@')
+        options[:addressee][i] = x + '@baidu.com'
+    end
+end
+if !options[:addressee].empty? and (exitstatus !=0 || !options[:failmail])
+    xslfile = File.dirname(File.dirname(__FILE__)) + '/tool/email_style.xsl' 
+    xmlfile = xunit_file_path
+    htmlMailContent = htmlMailContent || `xsltproc #{xslfile} #{xmlfile}`
+    #puts htmlMailContent
+
+    content_type_value = "text/html; charset=UTF-8"
+msgstr = <<EOF
+Subject: #{options[:title]} 
+From: #{options[:sender]} 
+To: #{options[:addressee].join(',')}
+MIME-Version: 1.0
+Content-type: #{content_type_value}  
+#{htmlMailContent}
+EOF
+    Net::SMTP.start('hotswap-c.baidu.com') do |smtp|
+        smtp.send_message msgstr, options[:sender], options[:addressee]
+    end
+end
+#File.delete xunit_file_path if File.exist? xunit_file_path and xunit_file_path != options[:xunit]
+# 发送xunit报告到指定的url中
+if options[:senddata] and (exitstatus !=0 || !options[:failmail])
+    sdata = open(xunit_file_path).read
+    url = URI.parse('http://wt.baidu.com/xs/lib/recData.php')
+    Net::HTTP.start(url.host, url.port) do |http|
+        req = Net::HTTP::Post.new(url.path)
+        req.set_form_data({ 'lx' => 'novelfrontMon', 'data' => sdata })
+        puts http.request(req).body
+    end
+end
+# 9. 发短信报警
+errorMessage = converted_text = Iconv.conv('GBK//IGNORE', 'UTF-8//IGNORE', errorMessage)
+if exitstatus !=0 and options[:phonenum].kind_of?(Array)
+    options[:phonenum].each do |num|
+        #system("gsmsend -s emp01.baidu.com:15008 #{num}@\"#{errorMessage}\"")
+        system("gsmsend -s emp01.baidu.com:15001 #{num}@\"#{errorMessage}\"")
+		#puts errorMessage
+    end
+end
+
+#10. 结束，返回用例执行状态
+exit exitstatus
